@@ -1,119 +1,58 @@
-import json
-from typing import Optional
-from pydantic import BaseModel
-from conversation_data import  ConversationList,ConversationItem,Message,ConversationManager
 import re
-# class ToolExe:
-#     def run(self,model_output):
-#         try :
-#             model_output ="fda"
-#             {
-#                 "from": "observation",
-#                 "value":  f"<|im_start|>user\n<tool_response>\n{model_output}\n</tool_response><|im_end|>\n",
-#             }
-#         except Exception as e :
-#             {
-#                 "from": "observation",
-#                 "value": f"<|im_start|>user\n<tool_response>\n{str(e)}\n</tool_response><|im_end|>\n",
-#             }
+from conversation_data import *
 class Environment:
-
     """
-    一个环境类，负责：
-    - 接受 user 输入 或 model 输出
-    - 自动判断消息类型
-    - 生成 Message 并写入 ConversationItem
+    环境类：
+    - 接受模型 response（batch）
+    - 自动识别 tool_call
+    - 自动写入 ConversationManager.active.items[i]
     """
 
-    def __init__(self, model,tokenizer,tool_exe,conversation_list: Con):
+    def __init__(self, model, tokenizer, tool_exe, conversation_manager):
         self.model = model
-        self.conversation_list = conversation_list
+        self.tokenizer = tokenizer
         self.tool_exe = tool_exe
-    def apply_template(self):
+        self.cm = conversation_manager   # ← 传入的是 ConversationManager
 
-    def build_model_inputs(self,max_length):
-        dialogs = []
-        for conversation in self.conversation_list:
-            system_value = conversation["system_prompt"]
-
-            tools = conversation["tools"]  # 保留转义
-            tools = json.loads(tools)
-            tools_str = "\n".join([json.dumps(t, ensure_ascii=False) for t in tools])
-            system_prompt = f"""<|im_start|>system
-            {system_value}
-
-            # Tools
-
-            You may call one or more functions to assist with the user query.
-
-            You are provided with function signatures within <tools></tools> XML tags:
-            <tools>
-            {tools_str}
-            </tools>
-
-            For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-            <tool_call>
-            {{"name": <function-name>, "arguments": <args-json-object>}}
-            </tool_call><|im_end|>
-            """
-            dialog = system_prompt
-            for i, turn in enumerate(conversation["conversations"]):
-                role = turn["from"]
-                value = turn["value"]
-                if role == "human":
-                    segment = f"<|im_start|>user\n{value}<|im_end|>\n"
-                elif role == "gpt":
-                    segment = f"<|im_start|>assistant\n{value}<|im_end|>\n"
-                elif role == "observation":
-                    segment = f"<|im_start|>user\n<tool_response>\n{value}\n</tool_response><|im_end|>\n"
-                else:
-                    raise ValueError(f"Unknown role: {role}")
-                dialog += segment
-            dialogs.append(dialog)
-
-        # ===== 批量编码 =====
-        enc = self.tokenizer(
-            dialogs,
-            add_special_tokens=False,
-            max_length=max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        return  enc
-
-    def has_tool_call(self,text: str) -> bool:
+    def has_tool_call(self, text: str) -> bool:
         return re.search(r"<tool_call>.*?</tool_call>", text, re.S) is not None
 
     # ===========================================================
-    # 用户输入 → human 消息
+    # 核心：处理模型 batch 输出
     # ===========================================================
+    def process_responses(self, responses):
+        """
+        responses: list[str]
+        自动写入到 cm.active.items[i].conversations
+        """
 
+        for i, text in enumerate(responses):
 
-    def process_next_turn(self,responses):
-        for i,item in enumerate(responses):
-            if self.has_tool_call(item):
-                function_call = {
-                    "from": "gpt",
-                    "value": item,
-                }
-                function_call = Message.model_validate(function_call)
-                self.conversation_list.get(i).add(function_call)
-                tool_response = self.tool_exe.run(item)
-                observation={
-                    "from": "observation",
-                    "value": tool_response,
-                }
-                observation=Message.model_validate(observation)
-                self.conversation_list.get(i).add(observation)
+            # 如果 active 不足以索引（可能有些被 finish），跳过
+            if i >= len(self.cm.active.items):
+                continue
+
+            conv: ConversationItem = self.cm.active.items[i]
+
+            # ===== case 1: tool_call =====
+            if self.has_tool_call(text):
+
+                # assistant 原始输出
+                conv.add("gpt", text)
+
+                # 工具执行
+                try:
+                    tool_result = self.tool_exe.run(text)
+                except Exception as e:
+                    tool_result = str(e)
+
+                # observation
+                conv.add("observation", tool_result)
+
+            # ===== case 2: 普通助手回复 =====
             else:
-                data = {
-                    "from": "gpt",
-                    "value": item,
-                }
-                msg = Message.model_validate(data)
-                self.conversation_list.get(i).add(msg)
-    def reward(self,conversation_list):
-        return [1]*len(conversation_list)
+                conv.add("gpt", text)
 
-
+    # 可自定义 reward
+    def reward(self):
+        return [1] * len(self.cm.active.items)
