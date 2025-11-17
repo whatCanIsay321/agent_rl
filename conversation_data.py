@@ -9,7 +9,7 @@ from transformers import BatchEncoding
 # Message
 # ============================================================
 class Message(BaseModel):
-    from_: Literal["human", "gpt", "observation"] = Field(alias="from")
+    from_: Literal["human", "gpt", "observation",""] = Field(alias="from")
     value: Any
 
     def export(self):
@@ -30,6 +30,9 @@ class ConversationItem(BaseModel):
         if isinstance(message, dict):
             message = Message.model_validate(message)
         self.conversations.append(message)
+
+    def clone(self):
+        return copy.deepcopy(self)
 
     def export(self):
         return {
@@ -120,7 +123,7 @@ For each function call, return:
     # 拼接 + tokenizer 编码（无 padding）
     # 返回：enc, spans (assistant token spans)
     # ============================================================
-    def encode_dialog(self, conv_dict):
+    def encode_dialog(self, conv_dict,need_response=True):
         system = self.build_system_prompt(conv_dict["system_prompt"], conv_dict["tools"])
 
         dialog = system
@@ -134,6 +137,8 @@ For each function call, return:
 
             if turn["from"] == "gpt":
                 spans.append((start, end))
+        if need_response:
+            dialog+="<|im_start|>assistant\n"
 
         enc = self.tokenizer(
             dialog,
@@ -151,10 +156,10 @@ For each function call, return:
         L = len(ids)
 
         if L > max_length:
-            ids = ids[-max_length:]
-            mask = mask[-max_length:]
+            ids = ids[:max_length]
+            mask = mask[:max_length]
             if other is not None:
-                other = other[-max_length:]
+                other = other[:max_length]
         else:
             pad = max_length - L
             ids = [pad_id] * pad + ids
@@ -193,10 +198,7 @@ For each function call, return:
             self.finished.add_conversation(self.active.pop(i))
 
         if not batch:
-            return BatchEncoding({
-                "input_ids": torch.empty(0),
-                "attention_mask": torch.empty(0),
-            })
+            return None
 
         return BatchEncoding({
             "input_ids": torch.stack([x["input_ids"] for x in batch]),
@@ -206,61 +208,43 @@ For each function call, return:
     # ============================================================
     # ② GRPO 训练阶段：输出 action_mask (0/1)
     # ============================================================
-    def build_grpo_sample(self, conv_dict, max_length=2048):
-        """
-        构建单条 GRPO 样本（单条对话 → tokenized → action_mask → 左padding）
-        conv_dict 必须是 conv.export() 的结果
-        """
-
-        # === 编码对话，得到 spans (哪些token是助手输出) ===
-        enc, spans = self.encode_dialog(conv_dict)
-
-        ids = enc["input_ids"]
-        mask = enc["attention_mask"]
-        offsets = enc["offset_mapping"]
-
-        # === assistant 的 token → 1，其余 → 0 ===
-        action_mask = []
-        for (tok_start, _), tid in zip(offsets, ids):
-            in_span = any(a <= tok_start < b for a, b in spans)
-            action_mask.append(1 if in_span else 0)
-
-        # === 做左 padding：input_ids / mask / action_mask 全部 pad ===
-        padded = self.left_pad(
-            ids,
-            mask,
-            other=action_mask,
-            max_length=max_length
-        )
-
-        # === 返回为 BatchEncoding，保持和你原来一致 ===
-        return BatchEncoding({
-            "input_ids": padded["input_ids"],
-            "attention_mask": padded["attention_mask"],
-            "action_mask": padded["other"],
-        })
 
     def build_grpo_batch(self, max_length=2048):
         """
         使用 export_all() 获取 active + finish 全部对话
         构建一个批次的 GRPO BatchEncoding
         """
-
         # 1. 获取所有对话（active + finish）
         conv_dicts = self.export_all()
-
-        # 2. 构建单条 GRPO 样本
-        samples = [
-            self.build_grpo_sample(conv_dict, max_length)
-            for conv_dict in conv_dicts
-        ]
-
-        # 3. 堆叠为 BatchEncoding
-        return BatchEncoding({
-            "input_ids": torch.stack([x["input_ids"] for x in samples]),
-            "attention_mask": torch.stack([x["attention_mask"] for x in samples]),
-            "action_mask": torch.stack([x["action_mask"] for x in samples]),
+        batch = []
+        for idx, conv in enumerate(conv_dicts):
+            enc, spans = self.encode_dialog(conv,need_response=False)
+            ids = enc["input_ids"]
+            offsets = enc["offset_mapping"]
+            action_mask = []
+            # === assistant 的 token → 1，其余 → 0 ===
+            for (token_start, _), token_id in zip(offsets, ids):
+                keep = False
+                for i, (span_start, span_end) in enumerate(spans):
+                    if span_start <= token_start < span_end:
+                        keep = True
+                        break
+                action_mask.append(1 if keep else 0)
+            padded = self.left_pad(ids, enc["attention_mask"], other=action_mask, max_length=max_length)
+            batch.append(padded)
+        res =  BatchEncoding({
+            "input_ids": torch.stack([x["input_ids"] for x in batch]),
+            "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+            "action_mask": torch.stack([x["other"] for x in batch]),
         })
+        filtered = [ids[mask.bool()] for ids, mask in zip(res["input_ids"], res["action_mask"])]
+        replies = self.tokenizer.batch_decode(
+            [seq.tolist() for seq in filtered],
+            skip_special_tokens=True
+        )
+        return res
+
+
 
     def export_all(self):
         """导出 active 和 finish 中所有对话为列表"""
