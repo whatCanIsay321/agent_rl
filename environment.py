@@ -61,12 +61,16 @@ class Environment:
 
     # 可自定义 reward
     def reward(self):
+        result = self.cm.export_all()
+        rewards = [0 for i in range(len(result))]
+        for i,conv in enumerate(result):
+            text = self.cm.raw_dialog(conv)
+            rewards[i]+=len(text)
 
-        conv_dicts = self.cm.export_all()
+        # 优势 (标准化)
 
 
-
-        return [1] * len(self.cm.export_all())
+        return  rewards
 
 if __name__ == "__main__":
     class IntroInput(BaseModel):

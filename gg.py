@@ -1,16 +1,16 @@
-from ToolExe import *
+from tools import ALL_TOOLS
+from tools.base import ToolExe
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BatchEncoding
 from dataclasses import dataclass
-from typing import Optional, List
 from conversation_data import ConversationManager, ConversationItem
 from environment import Environment
-
 
 @dataclass
 class GRPOConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    tool_exe:ToolExe = None
     device: str = "cpu"
     num_generations: int = 1
     clip_eps: float = 0.2
@@ -40,48 +40,7 @@ class GRPOTrainer:
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
 
-        class IntroInput(BaseModel):
-            name: str
-            lang: str = "zh"
-
-        class IntroOutput(RootModel[str]):
-            """你好"""
-            pass
-
-        class IntroTool(ToolBase[IntroInput, IntroOutput]):
-            name = "自我介绍"
-            description = "返回自我介绍文本"
-
-            Input = IntroInput
-            Output = IntroOutput
-
-            def run(self, data: IntroInput):
-                if data.lang == "zh":
-                    return f"你好，{data.name}！我是天智AI。"
-                return f"Hello, {data.name}! I'm Tianzhi AI."
-
-        class ListUsersInput(BaseModel):
-            limit: int = 5
-
-        from typing import List
-
-        class ListUsersOutput(RootModel[List[str]]):
-            """返回用户列表"""
-            pass
-
-        class ListUsersTool(ToolBase[ListUsersInput, ListUsersOutput]):
-            name = "获取用户列表"
-            description = "返回一个字符串列表，表示用户昵称"
-
-            Input = ListUsersInput
-            Output = ListUsersOutput
-
-            def run(self, data: ListUsersInput):
-                # 简单模拟：返回 limit 个用户名字
-                users = [f"用户{i + 1}" for i in range(data.limit)]
-                return users  # RootModel[List[str]] 的正确返回方式
-
-        tool_exe = ToolExe()
+        self.tool_exe = config.tool_exe
         self.cm = ConversationManager(tokenizer=self.tokenizer)
         # 环境
         self.env = Environment(self.tokenizer,tool_exe,self.cm)
@@ -139,7 +98,7 @@ class GRPOTrainer:
     # ---------------------------------------------------------------------
     # 计算 token log probability
     # ---------------------------------------------------------------------
-    def get_action_log_probs(self, model, input_ids, attention_mask, action_mask):
+    def get_action_log_probs(self, model, input_ids, attention_mask):
         out = model(input_ids, attention_mask=attention_mask)
         logits = out.logits  # (B, L, V)
 
@@ -147,7 +106,7 @@ class GRPOTrainer:
         target = input_ids.unsqueeze(-1)
         token_log_probs = log_probs.gather(-1, target).squeeze(-1)
 
-        return token_log_probs * action_mask
+        return token_log_probs
 
     def rollout(self):
         """
@@ -171,24 +130,23 @@ class GRPOTrainer:
 
         ids = grpo_batch["input_ids"]
         mask = grpo_batch["attention_mask"]
-        act_mask = grpo_batch["action_mask"]
+        action_mask = grpo_batch["action_mask"]
 
         # === 4. old & ref action log probs（token级）===
         with torch.no_grad():
-            old_lp = self.get_action_log_probs(self.model, ids, mask, act_mask)
+            old_lp = self.get_action_log_probs(self.model, ids, mask)
             if self.ref_model:
-                ref_lp = self.get_action_log_probs(self.ref_model, ids, mask, act_mask)
+                ref_lp = self.get_action_log_probs(self.ref_model, ids, mask)
             else:
                 ref_lp = None
-
-        return {
+        return BatchEncoding({
             "prompt_response_ids": ids,
             "attention_mask": mask,
-            "action_mask": act_mask,
+            "action_mask": action_mask,
             "old_action_log_probs": old_lp,
             "ref_action_log_probs": ref_lp,
             "advantages": advantages,
-        }
+        })
 
     # ---------------------------------------------------------------------
     # 计算 loss（PPO + GRPO KL 正则）
@@ -196,16 +154,15 @@ class GRPOTrainer:
     def compute_loss(self, batch):
         ids = batch["prompt_response_ids"]
         mask = batch["attention_mask"]
-        act_mask = batch["action_mask"]
-
+        action_mask = batch["action_mask"]
         # 当前策略模型的 log π
-        action_log_probs = self.get_action_log_probs(self.model, ids, mask, act_mask)
+        action_log_probs = self.get_action_log_probs(self.model, ids, mask)
 
         # KL 正则：log(ref) - log(policy)
         if self.cfg.beta != 0.0 and batch["ref_action_log_probs"] is not None:
             ref_lp = batch["ref_action_log_probs"]
-            log_ratio = (ref_lp - action_log_probs) * act_mask
-            k3 = (log_ratio.exp() - 1 - log_ratio) * act_mask  # GRPO KL
+            log_ratio = (ref_lp - action_log_probs) * action_mask
+            k3 = (log_ratio.exp() - 1 - log_ratio) * action_mask  # GRPO KL
         else:
             k3 = 0
 
@@ -218,18 +175,17 @@ class GRPOTrainer:
         else:
             old_lp = action_log_probs.detach()
 
-        ratio = torch.exp(action_log_probs - old_lp) * act_mask
-
-        loss1 = ratio * advantages
-        loss2 = torch.clamp(ratio, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps) * advantages
-
-        per_token_loss = -torch.min(loss1, loss2)
-        per_token_loss = per_token_loss * act_mask
+        coef_1 = torch.exp(action_log_probs - old_lp)
+        coef_2 = torch.clamp(coef_1, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps)
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)  # 一个序列中每个token的优势是一样的
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        per_token_loss = per_token_loss * action_mask
 
         if self.cfg.beta != 0.0:
             per_token_loss = per_token_loss + self.cfg.beta * k3
 
-        loss = per_token_loss.sum(dim=1) / act_mask.sum(dim=1)
+        loss = per_token_loss.sum(dim=1) / action_mask.sum(dim=1)
         return loss.mean()
 
     # ---------------------------------------------------------------------
@@ -255,6 +211,10 @@ class GRPOTrainer:
 
 
 if __name__ == "__main__":
+    tool_exe = ToolExe()
+    tool_exe.register(IntroTool())
+    tool_exe.register(ListUsersTool())
+
     cfg = GRPOConfig(
         model_name="Qwen/Qwen2.5-0.5B-Instruct",
         device="cpu",
@@ -263,7 +223,7 @@ if __name__ == "__main__":
     )
 
     trainer = GRPOTrainer(cfg)
-    trainer.rollout_multi_step()
+    # trainer.rollout_multi_step()
     trainer.rollout()
     # 添加对话
     # conv = ConversationItem(system_prompt="你是数学助手。", tools="[]")

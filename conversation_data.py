@@ -123,6 +123,19 @@ For each function call, return:
     # 拼接 + tokenizer 编码（无 padding）
     # 返回：enc, spans (assistant token spans)
     # ============================================================
+
+
+    def raw_dialog(self, conv_dict):
+        system = self.build_system_prompt(conv_dict["system_prompt"], conv_dict["tools"])
+
+        dialog = system
+        spans = []
+
+        for turn in conv_dict["conversations"]:
+            seg = self.format_turn(turn)
+            dialog += seg
+        return dialog
+
     def encode_dialog(self, conv_dict,need_response=True):
         system = self.build_system_prompt(conv_dict["system_prompt"], conv_dict["tools"])
 
@@ -194,7 +207,7 @@ For each function call, return:
             padded = self.left_pad(ids, enc["attention_mask"], other=None, max_length=max_length)
             batch.append(padded)
 
-        for i in reversed(remove):
+        for i in remove:
             self.finished.add_conversation(self.active.pop(i))
 
         if not batch:
