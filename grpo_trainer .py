@@ -4,10 +4,13 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, BatchEncoding
 from dataclasses import dataclass
+from torch.utils.data import Dataset, DataLoader
 from conversation_data import ConversationManager, ConversationItem
 from environment import Environment
-
-
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from torch.utils.data import DataLoader# 你已有
+from data_loader_jsonl import build_jsonl_dataloader
 # ============================================================
 # 配置
 # ============================================================
@@ -15,18 +18,18 @@ from environment import Environment
 class GRPOConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     tool_exe: ToolExe = None
-    device: str = "cpu"
+    device: str = "cpu"   # 会被 Accelerator 的 device 覆盖
 
     # GRPO 超参
     clip_eps: float = 0.2
     beta: float = 0.0            # KL 系数
     lr: float = 1e-5
 
-    # rollout_multi_step 多轮采样参数
-    trajectory: int = 2          # 采样的轨迹数
+    # rollout 多轮采样参数
+    trajectory: int = 2          # 每个进程采样的轨迹数
     max_steps: int = 2           # 每条轨迹的最大交互轮数
 
-    # rollout 采样 / 更新 参数
+    # rollout / 更新 参数
     num_iterations: int = 2      # 每次 rollout 后，在同一批数据上更新的次数
     max_length: int = 128        # prompt+response 最大长度
 
@@ -36,38 +39,50 @@ class GRPOConfig:
     # 是否使用 ref model
     use_ref_model: bool = True
 
-
 # ============================================================
-# GRPO Trainer
+# GRPO Trainer with Accelerate (每卡 + DataLoader 独立采样)
 # ============================================================
 class GRPOTrainer:
     def __init__(self, config: GRPOConfig):
         self.cfg = config
 
+        # ---------------- Accelerator ---------------- #
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.cfg.accumulation_steps
+        )
+        # 用 accelerator 的 device 覆盖 config.device
+        self.cfg.device = self.accelerator.device
+
+        # 每个进程用不同的随机种子 → 采样结果不同
+        base_seed = 42
+        set_seed(base_seed + self.accelerator.process_index)
+
         # ---------------- Tokenizer ---------------- #
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
         # ---------------- Policy Model ---------------- #
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.model_name
-        ).to(config.device)
+        # 先在 CPU 上初始化，之后交给 accelerator.prepare
+        model = AutoModelForCausalLM.from_pretrained(config.model_name)
+
+        # ---------------- Optimizer ---------------- #
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+
+        # 让 accelerate 管理 model / optimizer（多卡 DDP & device）
+        self.model, self.optimizer = self.accelerator.prepare(model, optimizer)
 
         # ---------------- Reference Model ---------------- #
+        # ref model 不需要反向传播，用普通的 to(device) 就好
         if config.use_ref_model:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 config.model_name
-            ).to(config.device)
+            ).to(self.cfg.device)
             self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
         else:
             self.ref_model = None
 
-        # ---------------- Optimizer ---------------- #
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
-
         # ---------------- Tool System ---------------- #
-        # 如果外部已经传入一个 ToolExe，就认为已经注册好工具，不再重复注册
         if config.tool_exe is not None:
             self.tool_exe = config.tool_exe
         else:
@@ -76,40 +91,46 @@ class GRPOTrainer:
                 self.tool_exe.register(ToolCls())
 
         # ---------------- Conversation Manager + Env ---------------- #
+        # 每个进程各自一份，互不干扰
         self.cm = ConversationManager(tokenizer=self.tokenizer)
         self.env = Environment(self.tokenizer, self.tool_exe, self.cm)
 
     # ============================================================
-    # 多轮 rollout（采样）
+    # 多轮 rollout（采样）—— 每个进程独立执行
     # ============================================================
     def rollout_multi_step(self, conv: ConversationItem):
         # 重置 active & finished
         self.cm.active.items = []
         self.cm.finished.items = []
+
+        # ⚠️ 为安全起见，可以 clone 一份 conv（取决于你的 ConversationItem 是否会被 env 修改）
+        # 这里假设 add_conversation 内部会复制，不直接改原对象
         self.cm.active.add_conversation(conv)
 
-        # 多轨迹复制
+        # 多轨迹复制（本进程内部）
         if self.cfg.trajectory > 1:
             self.cm.active.duplicate(self.cfg.trajectory - 1)
 
-        # rollout 前暂存 training 状态，用完恢复
-        was_training = self.model.training
-        self.model.eval()
+        # 用 unwrap_model 拿到底层 HF 模型，用于 generate
+        base_model = self.accelerator.unwrap_model(self.model)
+
+        # 暂存 training 状态，用完恢复
+        was_training = base_model.training
+        base_model.eval()
 
         # 多轮 rollout
         for step in range(self.cfg.max_steps):
-            print(f"\n=== 第 {step + 1} 轮采样 ===")
-
             batch = self.cm.build_model_batch(max_length=self.cfg.max_length)
             if batch is None or len(batch["input_ids"]) == 0:
-                print("No batch, break rollout")
+                if self.accelerator.is_main_process:
+                    print(f"[Rank {self.accelerator.process_index}] No batch, break rollout")
                 break
 
             batch = batch.to(self.cfg.device)
 
             # 模型生成（无梯度）
             with torch.no_grad():
-                generated_ids = self.model.generate(
+                generated_ids = base_model.generate(
                     **batch,
                     max_new_tokens=100,
                     top_p=0.9,
@@ -126,28 +147,21 @@ class GRPOTrainer:
 
             # 写回对话轨迹
             self.env.process_responses(replies)
-            print("本轮生成：", replies)
+            if self.accelerator.is_main_process:
+                print(f"[Rank {self.accelerator.process_index}] 第 {step+1} 轮生成: {replies}")
 
         # 恢复训练模式
-        self.model.train(was_training)
+        base_model.train(was_training)
 
     # ============================================================
-    # 修正确 token 对齐的 logprob（最重要）
+    # log prob 计算
     # ============================================================
     def get_action_log_probs(self, model, input_ids, attention_mask):
-        """
-        input_ids:      (B, T)
-        attention_mask: (B, T)
-        返回:
-        action_log_probs: (B, T-1) 对应每个 token (从第1个到最后一个) 的 log p(token_t | <t)
-        """
-        output = model(input_ids, attention_mask=attention_mask)
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = output.logits                          # (B, T, V)
 
-        # 预测 token_t 的 logits 位于位置 t-1
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # (B, T-1, V)
 
-        # input_ids[:, 1:] 是要预测的 token 序列
         log_probs_labels = log_probs.gather(
             dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
         )                                               # (B, T-1, 1)
@@ -155,10 +169,10 @@ class GRPOTrainer:
         return action_log_probs
 
     # ============================================================
-    # rollout → 构造 GRPO batch
+    # rollout → 构造 GRPO batch（每个进程独立）
     # ============================================================
-    def rollout(self, conv: ConversationItem):
-        # 1. 用当前策略 rollout
+    def rollout(self, conv: ConversationItem) -> BatchEncoding:
+        # 1. 用当前策略 rollout（本 rank 独立）
         self.rollout_multi_step(conv)
 
         # 2. 奖励（假设 env.reward() 返回一维列表或张量，长度为 B）
@@ -172,7 +186,6 @@ class GRPOTrainer:
         if rewards.numel() > 1:
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         else:
-            # 单样本时直接使用 centered reward
             advantages = rewards - rewards.mean()
 
         # 4. 构造 batch（包含 action_mask）
@@ -185,8 +198,9 @@ class GRPOTrainer:
         action_mask = grpo_batch["action_mask"]  # (B, T)
 
         # 5. 旧策略 logprob（固定为 rollout 时的策略）
+        base_model = self.accelerator.unwrap_model(self.model)
         with torch.no_grad():
-            old_lp = self.get_action_log_probs(self.model, ids, mask)  # (B, T-1)
+            old_lp = self.get_action_log_probs(base_model, ids, mask)  # (B, T-1)
 
             if self.ref_model is not None and self.cfg.beta != 0.0:
                 ref_lp = self.get_action_log_probs(self.ref_model, ids, mask)
@@ -212,10 +226,10 @@ class GRPOTrainer:
         # action_mask 对齐到 action_log_probs 的长度 (T-1)
         action_mask = batch["action_mask"][:, 1:]   # (B, T-1)
 
-        # 新策略 logprob
+        # 新策略 logprob（用 self.model，已经被 prepare 包装，会自动多卡）
         action_log_probs = self.get_action_log_probs(self.model, ids, mask)  # (B, T-1)
 
-        # Advantage shape 调整，(B,) -> (B,1)，方便广播到 (B, T-1)
+        # Advantage (B,) -> (B,1)，方便广播
         advantages = batch["advantages"]            # (B,)
         advantages = advantages.unsqueeze(1)        # (B,1)
 
@@ -237,86 +251,78 @@ class GRPOTrainer:
         # GRPO KL 项（与 ref_model 的 KL 正则）
         if self.cfg.beta != 0.0 and batch.get("ref_action_log_probs", None) is not None:
             ref_lp = batch["ref_action_log_probs"]  # (B, T-1)
-            # log_ratio = log(π_ref / π) = ref_lp - action_log_probs
             log_ratio = (ref_lp - action_log_probs) * action_mask
-            # k3 = exp(log_ratio) - 1 - log_ratio
             k3 = torch.exp(log_ratio) - 1 - log_ratio
             per_token_loss += self.cfg.beta * k3
 
-        # 对每个样本做 token 级别平均
         per_sample_denominator = action_mask.sum(dim=1).clamp(min=1)  # 防止除零
         loss = per_token_loss.sum(dim=1) / per_sample_denominator     # (B,)
         return loss.mean()
 
     # ============================================================
-    # 单步训练：在同一个 batch 上多次更新
+    # 单次 rollout 上的多次更新（所有 rank 各自用自己的 batch）
     # ============================================================
-    def train_step(self, batch: BatchEncoding):
-        """
-        在同一个 batch 上做 self.cfg.num_iterations 次更新。
-        注意：这里不再做 rollout，rollout 在 train() 里统一调用。
-        """
-        total_loss = 0.0
+    def train_step(self, batch: BatchEncoding, rollout_idx: int):
+        avg_loss = 0.0
 
         for it in range(self.cfg.num_iterations):
-            loss = self.compute_loss(batch)  # 标量
+            # accumulate 里自动处理梯度累加 + 多卡同步
+            with self.accelerator.accumulate(self.model):
+                loss = self.compute_loss(batch)
 
-            # 梯度累加
-            loss_scaled = loss / self.cfg.accumulation_steps
-            loss_scaled.backward()
+                self.accelerator.backward(loss)
 
-            total_loss += loss.item()
+                if self.accelerator.sync_gradients:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
-        # 返回平均 loss，方便打印
-        return total_loss / self.cfg.num_iterations
+            avg_loss += loss.item()
+
+            if self.accelerator.is_main_process:
+                print(f"[Rollout {rollout_idx} | Iter {it}] Loss = {loss.item():.6f}")
+
+        avg_loss /= max(self.cfg.num_iterations, 1)
+        return avg_loss
 
     # ============================================================
-    # 训练循环：一次 rollout，多次更新
+    # 训练循环：DataLoader + 每张卡独立 rollout
     # ============================================================
-    def train(self, conv: ConversationItem, steps: int = 100):
+    def train(self, dataloader: DataLoader, epochs: int = 1):
         """
-        steps: 要做多少次 rollout
-        每次 rollout 之后，在同一批数据上做 cfg.num_iterations 次更新
+        dataloader: 未经过 accelerator.prepare 的 DataLoader
+        每个 rank 会看到自己分片后的数据，因此每张卡的 ConversationItem 不同。
         """
-        self.optimizer.zero_grad()
-        update_step = 0  # 记录总的 “backward 次数”（用于梯度累加）
+        # 让 accelerate 处理 DataLoader 的分片
+        dataloader = self.accelerator.prepare(dataloader)
 
-        for i in range(steps):
-            # 1. 用当前策略 rollout 一次，得到一个 batch（含 old_action_log_probs）
-            batch = self.rollout(conv)
+        for epoch in range(epochs):
+            if self.accelerator.is_main_process:
+                print(f"\n===== Epoch {epoch} =====")
 
-            # 2. 在这个 batch 上做多次更新
-            avg_loss = self.train_step(batch)
-            update_step += self.cfg.num_iterations
+            for step, batch in enumerate(dataloader):
+                # batch 是 List[ConversationItem]，长度=batch_size（这里推荐=1）
+                for conv in batch:
+                    local_batch = self.rollout(conv)
+                    avg_loss = self.train_step(local_batch, rollout_idx=step)
 
-            # 3. 按照 accumulation_steps 做一次参数更新
-            if update_step % self.cfg.accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-            print(f"[Rollout {i}] Avg Loss = {avg_loss:.6f}")
-
-        # 处理最后一批不足 accumulation_steps 的残余梯度
-        if update_step % self.cfg.accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+                if self.accelerator.is_main_process:
+                    print(f"[Epoch {epoch} | Step {step}] Avg Loss (rank0 view) = {avg_loss:.6f}")
 
 
-# ============================================================
-# 入口
-# ============================================================
+
+from conversation_data import ConversationItem
+
 if __name__ == "__main__":
-    conv = ConversationItem(
-        system_prompt="你是一个数学助手。",
-        tools="[]"
+    dataloader = build_jsonl_dataloader(
+        jsonl_paths=["data/train1.jsonl", "data/train2.jsonl"],
+        ConversationItemClass=ConversationItem,
+        batch_size=1,  # 每个 rank 每 step 1 条样本
+        shuffle=True
     )
-    conv.add_message({"from": "human", "value": "1+1等于多少？"})
 
-    # 让 GRPOTrainer 自己创建并注册工具，避免重复注册
-    cfg = GRPOConfig(tool_exe=None, device="cpu")
+    cfg = GRPOConfig()
     trainer = GRPOTrainer(cfg)
 
-    # 训练：steps 是 rollout 次数，每次 rollout 上做 cfg.num_iterations 次更新
-    trainer.train(conv, steps=1000)
+    # 交给 trainer 内部的 self.accelerator 处理多卡 & 梯度累加
+    trainer.train(dataloader, epochs=1)

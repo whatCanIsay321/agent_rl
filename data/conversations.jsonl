@@ -1,0 +1,3 @@
+{"id":"ex1","system_prompt":"你是一个数学助手。","tools":"[]","messages":[{"from":"human","value":"1+1等于多少？"}]}
+{"id":"ex2","system_prompt":"你是一个数学助手。","tools":"[]","messages":[{"from":"human","value":"积分 x^2 从 0 到 1 等于多少？"}]}
+{"id":"ex3","system_prompt":"你是一个数学助手。","tools":"[]","messages":[{"from":"human","value":"求解方程 x^2 - 3x + 2 = 0"}]}
